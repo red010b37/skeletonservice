@@ -22,7 +22,7 @@ before_install:
 install:
 - go get -u github.com/golang/dep/...
 - dep ensure -v
-- gcloud config set project logmate-api
+- gcloud config set project [project-id]
 
 script:
 - go test -v -race ./...
