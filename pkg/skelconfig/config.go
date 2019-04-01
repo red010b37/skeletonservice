@@ -1,222 +1,267 @@
 package skelconfig
 
 import (
-	"bytes"
+	"cloud.google.com/go/firestore"
 	"cloud.google.com/go/kms/apiv1"
-	"cloud.google.com/go/storage"
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	_ "github.com/lib/pq"
 	"github.com/spf13/viper"
-	kmspb "google.golang.org/genproto/googleapis/cloud/kms/v1"
 	"io/ioutil"
 	"log"
+	"net/http"
 )
 
+type MapConfig map[string]interface{}
+
 var AppConfig appConfig
+var ENV env
+var ApiVersion = "1.0.0"
 
 var DBconn *sql.DB
 
-type appConfig struct {
-	DBHost     string
-	DBUser     string
-	DBPassword string
-	DBName     string
-	DBPort     int
+type env struct {
+	ProjectId string
 
-	HashPepper string
+	HostName     string
+	InstanceId   string
+	DeploymentId string
+	ServiceName  string
+	Version      string
+	IsLocal      bool
+}
+
+type appConfig struct {
+	//DBHost     string
+	//DBUser     string
+	//DBPassword string
+	//DBName     string
+	//DBPort     int
+
+	JWTSecret    string
+	ConfigUrl    string
+	ConfigApiKey string
 }
 
 var kmsClient *kms.KeyManagementClient
 
-// init is auto run on import - this sets up the whole config for the app
+// init is auto run on import - this float64sets up the whole config for the app
 // It also check for all the runtime vars and db connections required
 // to make the auth service run
 func init() {
 
-	viper.SetEnvPrefix("skelsvc")
-	viper.AutomaticEnv()
-
-	bucket := viper.Get("CONFIG_BUCKET")
-	configLocation := viper.Get("CONFIG_LOCATION")
-
-	var decodedConf []byte
-	var err error
-	if bucket == nil || configLocation == nil {
-		log.Println("Env vars SKELSVC_CONFIG_BUCKET and/or SKELSVC_CONFIG_LOCATION not found")
-		decodedConf = loadConfigFromLocal()
-	} else {
-		decodedConf, err = loadConfigFromStorage(bucket.(string), configLocation.(string))
-		if err != nil {
-			log.Fatal(err)
-		}
-	}
-
-	// load the config into viper
-	viper.SetConfigType("yaml")
-	err = viper.ReadConfig(bytes.NewReader(decodedConf))
-	if err != nil { // Handle errors reading the config file
-		panic(fmt.Errorf("Fatal error config file: %s \n", err))
-	}
-
-	// make is easily easy to access and check all the vars
-	checkAndParseConfig()
-	checkDBConnection()
-}
-
-func checkDBConnection() {
-
-	dbinfo := fmt.Sprintf("host=%s user=%s password=%s dbname=%s port=%d",
-		AppConfig.DBHost,
-		AppConfig.DBUser,
-		AppConfig.DBPassword,
-		AppConfig.DBName,
-		AppConfig.DBPort)
-
-	var err error
-	DBconn, err = sql.Open("postgres", dbinfo)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	err = DBconn.Ping()
-	if err != nil {
-		DBconn.Close()
-		log.Fatal(err)
-	}
-
-}
-
-func loadConfigFromLocal() []byte {
-
-	log.Println("Attempting to load config from local file: local-config.yaml.enc ")
-
-	dat, err := ioutil.ReadFile("local-config.yaml.enc")
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	decodedConf, err1 := decryptConfig(dat)
-	if err1 != nil {
-		log.Fatal(err1)
-		//return nil, err
-	}
-
-	return decodedConf
-
-}
-
-// explicit reads credentials from the specified path.
-func loadConfigFromStorage(bucket string, configPath string) ([]byte, error) {
-
-	log.Println(fmt.Sprintf("Loading config from cloud storage. path=%v/%v", bucket, configPath))
-
-	ctx := context.Background()
-
-	// For API packages whose import path is starting with "cloud.google.com/go",
-	// such as cloud.google.com/go/storage in this case, if there are no credentials
-	// provided, the client library will look for credentials in the environment.
-	storageClient, err := storage.NewClient(ctx)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	rc, err := storageClient.Bucket(bucket).Object(configPath).NewReader(ctx)
-	if err != nil {
-		log.Fatal(err)
-		//return nil, err
-	}
-	defer rc.Close()
-
-	slurp, err := ioutil.ReadAll(rc)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	decodedConf, err1 := decryptConfig(slurp)
-	if err1 != nil {
-		log.Fatal(err1)
-	}
-
-	return decodedConf, nil
-
-}
-
-func checkAndParseConfig() {
-
 	AppConfig = appConfig{}
 
-	// DB VARS
-	AppConfig.DBHost = viper.GetString("DB_HOST")
-	AppConfig.DBUser = viper.GetString("DB_USER")
-	AppConfig.DBPassword = viper.GetString("DB_PASSWORD")
-	AppConfig.DBName = viper.GetString("DB_NAME")
-	AppConfig.DBPort = viper.GetInt("DB_PORT")
+	getEnvVars()
 
-	// HASH VARS
-	AppConfig.HashPepper = viper.GetString("HASH_PEPPER")
+	// Check to see if system is running tests on travis
 
-	if AppConfig.DBHost == "" {
-		log.Fatal("Cannot find the DB_HOST in the config")
+	if isRunningTests() {
+		return
 	}
 
-	if AppConfig.DBUser == "" {
-		log.Fatal("Cannot find DB_USER in the config")
+	if ENV.IsLocal {
+		log.Println("IsLocal IS set looking env service overrides")
+		discoverLocalConfigService()
+	} else {
+
+		log.Println("IsLocal is NOT set connecting to config service")
+		discoverConfigService()
 	}
 
-	if AppConfig.DBPassword == "" {
-		log.Fatal("Cannot find DB_PASSWORD in the config")
+	loadConfigFromConfigService()
+
+	errArr := checkConfig()
+	if len(errArr) != 0 {
+
+		for _, err := range errArr {
+			log.Println(err.Error())
+		}
+
+		log.Fatal("Missing Config vars above")
+
 	}
 
-	if AppConfig.DBName == "" {
-		log.Fatal("Cannot find DB_NAME in the config")
+	//checkDBConnection()
+}
+
+func isRunningTests() bool {
+
+	if viper.GetString("RACK_ENV") == "test" {
+		return true
+	} else {
+		return false
 	}
 
-	if AppConfig.DBName == "" {
-		log.Fatal("Cannot find DB_NAME in the config")
+}
+
+func discoverLocalConfigService() {
+
+	configURL := viper.GetString("GLO_CONFIG_URL")
+
+	if configURL == "" {
+		log.Fatal("GLO_CONFIG_URL is not set")
 	}
 
-	if AppConfig.DBPort == 0 {
-		log.Fatal("Cannot find DB_PORT in the config")
-	}
+	AppConfig.ConfigUrl = configURL
 
-	if AppConfig.HashPepper == "" {
-		log.Fatal("Cannot find HASH_PEPPER in the config")
+}
+
+func loadConfigFromConfigService() {
+
+	url := fmt.Sprintf("%s/v1/subscriptions?key=%s", AppConfig.ConfigUrl, AppConfig.ConfigApiKey)
+
+	resp, err := http.Get(url)
+	checkErr(err)
+
+	defer resp.Body.Close()
+	body, err := ioutil.ReadAll(resp.Body)
+
+	toMap := MapConfig{}
+
+	err = json.Unmarshal(body, &toMap)
+	checkErr(err)
+
+	data := toMap["data"].(map[string]interface{})
+
+	AppConfig.JWTSecret = data["GLO_V1_JWT_SECRET"].(string)
+
+}
+
+func FirestoreClient() *firestore.Client {
+
+	ctx := context.Background()
+
+	client, err := firestore.NewClient(ctx, ENV.ProjectId)
+	checkErr(err)
+
+	return client
+}
+
+func discoverConfigService() {
+
+	client := FirestoreClient()
+	// Close client when done.
+	defer client.Close()
+
+	ctx := context.Background()
+	snapshot, snapErr := client.Collection("system-env").Doc("config-location").Get(ctx)
+	checkErr(snapErr)
+
+	url, urlDataErr := snapshot.DataAt("url")
+	checkErr(urlDataErr)
+
+	apiKey, apiErr := snapshot.DataAt("apiKey")
+	checkErr(apiErr)
+
+	AppConfig.ConfigApiKey = apiKey.(string)
+	AppConfig.ConfigUrl = url.(string)
+
+}
+
+func checkErr(err error) {
+	if err != nil {
+		log.Fatal(err)
 	}
 }
 
-func decryptConfig(cipher []byte) ([]byte, error) {
-	ctx := context.Background()
+func getEnvVars() {
 
-	var err error
-	kmsClient, err = kms.NewKeyManagementClient(ctx)
-	if err != nil {
+	ENV = env{}
+	viper.SetDefault("IS_LOCAL", false)
+	viper.SetDefault("GOOGLE_CLOUD_PROJECT", "logmate-platform-prod")
 
-		s := `
------------------------------------------------------------------------------
-APPLICATION START ERROR
-------------------------------------------------------------------------------
-DOING LOCAL DEV?:
-Ask for a service account or from the Cloud Console, create a service account, 
-download its json credentials file, then set the GOOGLE_APPLICATION_CREDENTIALS 
-environment variable:
-export GOOGLE_APPLICATION_CREDENTIALS=/path/to/your-project-credentials.json
------------------------------------------------------------------------------
-`
-		log.Fatal(s)
+	// Read teh AppEngine settings - set local dev first
+	viper.SetDefault("GAE_DEPLOYMENT_ID", 0)
+	viper.SetDefault("GAE_INSTANCE", "local-instacne")
+	viper.SetDefault("GAE_SERVICE", "local-subservice")
+	viper.SetDefault("GAE_VERSION", "local-version")
+	viper.SetDefault("HOSTNAME", "local-hostname")
+
+	// read the end
+	viper.AutomaticEnv()
+
+	ENV.ProjectId = viper.GetString("GOOGLE_CLOUD_PROJECT")
+	ENV.DeploymentId = viper.GetString("GAE_DEPLOYMENT_ID")
+	ENV.InstanceId = viper.GetString("GAE_INSTANCE")
+	ENV.ServiceName = viper.GetString("GAE_SERVICE")
+	ENV.Version = viper.GetString("GAE_VERSION")
+	ENV.HostName = viper.GetString("HOSTNAME")
+	ENV.IsLocal = viper.GetBool("IS_LOCAL")
+
+}
+
+//func checkDBConnection() {
+//
+//	mode := "require"
+//
+//	if ENV.IsLocal {
+//		log.Println("Is in local mode disabling ssl")
+//		mode = "disable"
+//	}
+//
+//	dbinfo := fmt.Sprintf("host=%s user=%s password=%s dbname=%s port=%d sslmode=%s",
+//		AppConfig.DBHost,
+//		AppConfig.DBUser,
+//		AppConfig.DBPassword,
+//		AppConfig.DBName,
+//		AppConfig.DBPort,
+//		mode)
+//
+//	var err error
+//	DBconn, err = sql.Open("postgres", dbinfo)
+//	if err != nil {
+//		log.Fatal(err)
+//	}
+//
+//	err = DBconn.Ping()
+//	if err != nil {
+//		DBconn.Close()
+//		log.Fatal(err)
+//	}
+//
+//	log.Println("DB ping successful")
+//
+//}
+
+func checkConfig() []error {
+
+	errorArr := []error{}
+	//
+	//if AppConfig.DBHost == "" {
+	//	errorArr = append(errorArr, ConfDBHostErr)
+	//}
+	//
+	//if AppConfig.DBUser == "" {
+	//	errorArr = append(errorArr, ConfDBUserErr)
+	//}
+	//
+	//if AppConfig.DBPassword == "" {
+	//	errorArr = append(errorArr, ConfDBPasswordErr)
+	//}
+	//
+	//if AppConfig.DBName == "" {
+	//	log.Println()
+	//	errorArr = append(errorArr, ConfDBNameErr)
+	//}
+	//
+	//if AppConfig.DBPort == 0 {
+	//	errorArr = append(errorArr, ConfDBPortErr)
+	//}
+	//
+	//if AppConfig.HashPepper == "" {
+	//	errorArr = append(errorArr, ConfHashPepperErr)
+	//}
+
+	if AppConfig.JWTSecret == "" {
+		errorArr = append(errorArr, ConfJWTSecretErr)
 	}
 
-	req := &kmspb.DecryptRequest{
-		Name:       "projects/[project-id]/locations/global/keyRings/[keyring]/cryptoKeys/[key]",
-		Ciphertext: cipher,
-	}
+	//if AppConfig.ConfigUrl == "" {
+	//	errorArr = append(errorArr, ConfConfigURLErr)
+	//}
 
-	resp, err := kmsClient.Decrypt(ctx, req)
-
-	if err != nil {
-		return nil, err
-	}
-	return resp.Plaintext, nil
-
+	return errorArr
 }
